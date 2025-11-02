@@ -33,5 +33,7 @@ __pypackages__/
 .ruff_cache/
 
 #Data 
-
 Dataset/
+
+#.env 
+.env
