@@ -4,7 +4,7 @@ import torch
 class RewardConfigs:
     def __init__(self):
         # Model settings
-        self.model_path = "./checkpoints/sft_model"  # Path to SFT checkpoint
+        self.model_path = "./checkpoints/sft_model" 
         self.torch_dtype = torch.float16
         self.device = "auto"
 
