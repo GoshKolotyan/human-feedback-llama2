@@ -1,12 +1,14 @@
 import os
+import json
 import torch
 import torch.nn as nn
-from datasets import load_from_disk
-from torch.optim import AdamW
-from torch.utils.data import DataLoader
-from peft import PeftModel, AutoPeftModelForCausalLM
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
+
 from tqdm import tqdm
+from torch.optim import AdamW
+from datasets import load_from_disk
+from torch.utils.data import DataLoader
+from peft import AutoPeftModelForCausalLM
+from transformers import AutoTokenizer, get_scheduler
 
 from src.configs.reward_configs import RewardConfigs
 from src.data.data_utils import PreferencePairDataset, collate_fn
@@ -19,14 +21,12 @@ class RewardModel(nn.Module):
         super().__init__()
         self.base_model = base_model
         
-        # Get hidden size from config
         hidden_size = base_model.config.hidden_size
         
-        # Add linear head that outputs a single scalar reward
+        #linear head that outputs a single scalar reward
         self.reward_head = nn.Linear(hidden_size, 1, bias=False)
         
     def forward(self, input_ids, attention_mask):
-        # Get hidden states from base model
         outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -34,17 +34,17 @@ class RewardModel(nn.Module):
             return_dict=True
         )
         
-        # Get the last hidden state
+        #last hidden state
         hidden_states = outputs.hidden_states[-1]  # [batch_size, seq_len, hidden_size]
         
-        # Get reward logits for all positions
+        #reward logits for all positions
         rewards = self.reward_head(hidden_states).squeeze(-1)  # [batch_size, seq_len]
         
-        # Extract reward at the last non-padding token for each sequence
+        #reward at the last non-padding token for each sequence
         sequence_lengths = attention_mask.sum(dim=1) - 1  # -1 for 0-indexing
         batch_size = rewards.shape[0]
         
-        # Gather the reward at the last position
+        #the reward at the last position
         final_rewards = rewards[torch.arange(batch_size, device=rewards.device), sequence_lengths]
         
         return final_rewards  # [batch_size]
@@ -62,40 +62,33 @@ class RewardModelTrainer:
 
     def load_dataset(self):
         """Load train and eval datasets from disk."""
-        print("Loading datasets...")
         self.train_dataset = load_from_disk(dataset_path=self.configs.train_path)
         self.eval_dataset = load_from_disk(dataset_path=self.configs.eval_path)
-        print(f"✓ Loaded {len(self.train_dataset)} training samples")
-        print(f"✓ Loaded {len(self.eval_dataset)} eval samples")
+        print(f"Loaded {len(self.train_dataset)} training samples")
+        print(f"Loaded {len(self.eval_dataset)} eval samples")
 
     def init_model_and_tokenizer(self, checkpoint_path: str = "./checkpoints/sft_model"):
         """Initialize the reward model from a fine-tuned SFT checkpoint."""
-        print(f"Loading fine-tuned model from: {checkpoint_path}")
         
-        # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        print("✓ Tokenizer loaded")
         
-        # Load the base model (with LoRA adapters if present)
         base_model = AutoPeftModelForCausalLM.from_pretrained(
             checkpoint_path,
             torch_dtype=torch.float16,
             device_map="auto",
             low_cpu_mem_usage=True,
         )
-        print("✓ Base model with LoRA adapters loaded")
         
-        # Wrap with reward head
+        #wraping with reward head
         reward_model = RewardModel(base_model)
         reward_model = reward_model.to(self.device)
         
-        # Enable gradient checkpointing to save memory
+        #gradient checkpointing to save memory
         if hasattr(base_model, "enable_input_require_grads"):
             base_model.enable_input_require_grads()
         
-        print("✓ Reward head added")
         return reward_model
 
     @staticmethod
@@ -114,18 +107,26 @@ class RewardModelTrainer:
         self.model.eval()
         correct = 0
         total = 0
-        
+
+        # Use AMP during evaluation to match training dtype
+        use_amp = getattr(self.configs, "use_amp", True) and torch.cuda.is_available()
+
         with torch.no_grad():
             for batch in eval_loader:
-                # Move to device
+                # to cuda
                 chosen_input_ids = batch['chosen_input_ids'].to(self.device)
                 chosen_attention_mask = batch['chosen_attention_mask'].to(self.device)
                 rejected_input_ids = batch['rejected_input_ids'].to(self.device)
                 rejected_attention_mask = batch['rejected_attention_mask'].to(self.device)
-                
-                # Get rewards
-                chosen_rewards = self.model(chosen_input_ids, chosen_attention_mask)
-                rejected_rewards = self.model(rejected_input_ids, rejected_attention_mask)
+
+                #rewards with autocast to handle dtype consistency
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        chosen_rewards = self.model(chosen_input_ids, chosen_attention_mask)
+                        rejected_rewards = self.model(rejected_input_ids, rejected_attention_mask)
+                else:
+                    chosen_rewards = self.model(chosen_input_ids, chosen_attention_mask)
+                    rejected_rewards = self.model(rejected_input_ids, rejected_attention_mask)
                 
                 # Count how many times chosen > rejected
                 correct += (chosen_rewards > rejected_rewards).sum().item()
@@ -159,7 +160,6 @@ class RewardModelTrainer:
             shuffle=True,
             collate_fn=collate_fn,
         )
-        print(f"✓ Training dataloader ready: {len(train_loader)} batches")
 
         eval_loader = None
         if self.eval_dataset is not None:
@@ -173,7 +173,6 @@ class RewardModelTrainer:
                 batch_size=batch_size, 
                 collate_fn=collate_fn
             )
-            print(f"✓ Eval dataloader ready: {len(eval_loader)} batches")
 
         # 4) Optimizer and scheduler
         lr = getattr(self.configs, "reward_lr", 1e-5)
@@ -195,15 +194,10 @@ class RewardModelTrainer:
             num_warmup_steps=warmup_steps,
             num_training_steps=total_steps,
         )
-        
-        print(f"✓ Optimizer configured: lr={lr}, weight_decay={weight_decay}")
-        print(f"✓ Scheduler: {warmup_steps} warmup steps, {total_steps} total steps")
 
-        # Mixed precision training
+        #mixed precision training
         use_amp = getattr(self.configs, "use_amp", True) and torch.cuda.is_available()
         scaler = torch.cuda.amp.GradScaler() if use_amp else None
-        if use_amp:
-            print("✓ Using automatic mixed precision (AMP)")
 
         # 5) Training loop
         print("\n" + "="*80)
@@ -221,7 +215,7 @@ class RewardModelTrainer:
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
             
             for batch_idx, batch in enumerate(progress_bar):
-                # Move batch to device
+                #batch to cuda
                 chosen_input_ids = batch['chosen_input_ids'].to(self.device)
                 chosen_attention_mask = batch['chosen_attention_mask'].to(self.device)
                 rejected_input_ids = batch['rejected_input_ids'].to(self.device)
@@ -229,7 +223,7 @@ class RewardModelTrainer:
                 
                 optimizer.zero_grad()
                 
-                # Forward pass with mixed precision
+                #forward pass with mixed precision
                 if use_amp:
                     with torch.cuda.amp.autocast():
                         chosen_rewards = self.model(chosen_input_ids, chosen_attention_mask)
@@ -240,7 +234,6 @@ class RewardModelTrainer:
                     rejected_rewards = self.model(rejected_input_ids, rejected_attention_mask)
                     loss = self.pairwise_loss(chosen_rewards, rejected_rewards)
                 
-                # Backward pass
                 if use_amp:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -254,16 +247,15 @@ class RewardModelTrainer:
                 
                 scheduler.step()
                 
-                # Track metrics
                 epoch_loss += loss.item()
                 global_step += 1
                 
-                # Calculate batch accuracy
+                #batch accuracy
                 with torch.no_grad():
                     correct_predictions += (chosen_rewards > rejected_rewards).sum().item()
                     total_pairs += len(chosen_rewards)
                 
-                # Update progress bar
+                #updating progress bar
                 if batch_idx % 10 == 0:
                     avg_loss = epoch_loss / (batch_idx + 1)
                     batch_acc = correct_predictions / total_pairs if total_pairs > 0 else 0.0
@@ -273,7 +265,6 @@ class RewardModelTrainer:
                         'lr': f'{scheduler.get_last_lr()[0]:.2e}'
                     })
             
-            # End of epoch statistics
             avg_epoch_loss = epoch_loss / len(train_loader)
             train_acc = correct_predictions / total_pairs if total_pairs > 0 else 0.0
             
@@ -283,40 +274,56 @@ class RewardModelTrainer:
             print(f"Average Loss: {avg_epoch_loss:.4f}")
             print(f"Train Pairwise Accuracy: {train_acc:.4f}")
             
-            # Evaluation
             if eval_loader is not None:
                 print("\nRunning evaluation...")
                 eval_acc = self.evaluate(eval_loader)
                 print(f"Eval Pairwise Accuracy: {eval_acc:.4f}")
                 print(f"{'='*80}\n")
 
-        # 6) Save model & tokenizer
+        # 6) Save model and tokenizer
         out_dir = getattr(
-            self.configs, 
-            "reward_output_dir", 
+            self.configs,
+            "reward_output_dir",
             getattr(self.configs, "output_dir", "./checkpoints/reward_model")
         )
         os.makedirs(out_dir, exist_ok=True)
-        
+
         print(f"\nSaving reward model to {out_dir}...")
-        
-        # Save the reward model (base + head)
-        torch.save(self.model.state_dict(), os.path.join(out_dir, "reward_model.pt"))
-        
-        # Also save the base model config and tokenizer
-        self.model.base_model.config.save_pretrained(out_dir)
+
+        #save PEFT model (LoRA adapters)
+        self.model.base_model.save_pretrained(out_dir)
+
+        #save only the reward head weights separately
+        reward_head_state = {
+            'reward_head.weight': self.model.reward_head.weight.data.cpu()
+        }
+        torch.save(reward_head_state, os.path.join(out_dir, "reward_head.pt"))
+
+        #save tokenizer
         self.tokenizer.save_pretrained(out_dir)
-        
-        # Save training config
-        import json
-        config_dict = vars(self.configs)
+
+        config_dict = vars(self.configs).copy()
+
+        # Convert non-serializable objects to strings
+        for key, value in config_dict.items():
+            if hasattr(value, '__name__'):  # Functions, classes, types
+                config_dict[key] = str(value)
+            elif isinstance(value, torch.dtype):
+                config_dict[key] = str(value)
+            elif not isinstance(value, (int, float, str, bool, list, dict, type(None))):
+                config_dict[key] = str(value)
+
         with open(os.path.join(out_dir, "training_config.json"), "w") as f:
             json.dump(config_dict, f, indent=2)
-        
-        print("✓ Reward model saved successfully!")
-        print(f"  - Model weights: {out_dir}/reward_model.pt")
-        print(f"  - Tokenizer: {out_dir}/tokenizer_config.json")
-        print(f"  - Config: {out_dir}/training_config.json")
+
+        print("\n" + "="*80)
+        print("Reward Model Saved Successfully!")
+        print("="*80)
+        print(f"Location: {out_dir}")
+        print(f"  - Base model + LoRA: adapter_config.json, adapter_model.bin")
+        print(f"  - Reward head: reward_head.pt")
+        print(f"  - Tokenizer: tokenizer_config.json, tokenizer.json")
+        print(f"  - Training config: training_config.json")
         
         return self.model
     
